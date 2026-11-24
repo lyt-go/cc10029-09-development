@@ -9,6 +9,7 @@ import hashlib
 import time
 from typing import Any
 
+from app.services import delivery
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -39,14 +40,17 @@ class ChecksumVerifyService(BaseModuleService):
         entry, missing = self.create_entry(values)
         if entry is None:
             raise ValueError(f"创建校验任务失败: {missing}")
-        return {"verify_code": verify_code, "verify_id": entry["id"], "batch_code": batch_code}
+        # 自动执行校验：批次产物与暂存产物都读不到时，不能静默判通过。
+        result = self.execute_verification(entry["id"])
+        return {"verify_code": verify_code, "verify_id": entry["id"], "batch_code": batch_code,
+                "executed": result}
 
     def execute_verification(self, verify_id: int) -> dict[str, Any]:
         """执行校验核对：读取传输批次产物文件和暂存落地产物文件，逐分片比对校验值。
 
         本方法实现数据交换平台的核心质量保障：从传输产物文件计算源端校验值，
         从暂存产物文件计算目标端校验值，逐分片比对并统计差异条数。
-        校验结果直接决定后续冲突裁决和拒收处置。
+        校验结果直接决定后续冲突裁决和拒收处置。空批次在两侧都真实为空时判定通过。
         """
         verify_entry = self.get_entry(verify_id)
         if verify_entry is None:
@@ -58,16 +62,30 @@ class ChecksumVerifyService(BaseModuleService):
 
         batch_code = verify_entry["批次编号"]
 
-        # 读取传输批次产物文件（源端数据）
-        batch_file = self._data_dir("batches") / f"{batch_code}.jsonl"
-        batch_records = self._read_jsonl(batch_file)
+        # 严格读取传输批次产物文件（源端数据）
+        batch_file = self._data_dir("batches") / f"{delivery.safe_name(batch_code)}.jsonl"
+        batch_source = delivery.read_artifact_strict(batch_file)
 
-        # 从暂存产品目录查找对应落地产物文件（目标端数据）
+        # 从暂存落地产物目录查找对应落地产物文件（目标端数据）
         staging_dir = self._data_dir("staging")
-        staging_records = []
-        for staging_file in staging_dir.glob(f"*{batch_code}*.jsonl"):
-            staging_records = self._read_jsonl(staging_file)
+        staging_source = {
+            "state": delivery.STATE_MISSING, "records": [], "reason": "目标端尚无落地产物",
+            "reason_code": "STAGING_MISSING", "readable": False,
+        }
+        for staging_file in sorted(staging_dir.glob(f"*{delivery.safe_name(batch_code)}*.jsonl"),
+                                   reverse=True):
+            staging_source = delivery.read_artifact_strict(staging_file)
             break
+
+        batch_records = batch_source["records"]
+        staging_records = staging_source["records"]
+
+        # 任一侧读不到时不能判定通过，只登记未通过原因。
+        unreadable = [
+            side for side, source in (("batch", batch_source), ("staging", staging_source))
+            if source["state"] in {delivery.STATE_MISSING, delivery.STATE_UNREADABLE,
+                                   delivery.STATE_CORRUPT}
+        ]
 
         # 计算源端与目标端校验值
         source_checksum = self._compute_checksum(str(batch_records))
@@ -87,23 +105,26 @@ class ChecksumVerifyService(BaseModuleService):
             chunk_diffs.append({"chunk_index": i // chunk_size, "source_hash": b_hash,
                                "target_hash": s_hash, "diff": diff})
 
-        # 判定校验结论
-        passed = total_diff == 0
+        # 判定校验结论：读不到任何一侧都不算通过。
+        if unreadable:
+            total_diff = max(total_diff, 1)
+        passed = total_diff == 0 and not unreadable
         source_val = f"SHA256:{source_checksum}"
         target_val = f"SHA256:{target_checksum}"
         entry["源端校验值"] = source_val
         entry["目标校验值"] = target_val
         entry["差异条数"] = str(total_diff)
+        entry["校验结论"] = "已通过" if passed else "未通过"
 
         result_action = "判定通过" if passed else "判定未过"
         final_entry, _ = self.run_action(verify_id, result_action)
 
         # 写入校验结论日志，记录源端与目标端校验详情
-        self._write_jsonl(
+        delivery.append_jsonl(
             self._data_dir("events") / "verify_log.jsonl",
             [{"action": "verify", "batch_code": batch_code, "source_checksum": source_checksum,
               "target_checksum": target_checksum, "diff_count": total_diff,
-              "passed": passed, "verified_at": time.time()}]
+              "unreadable": unreadable, "passed": passed, "verified_at": time.time()}]
         )
 
         result = {
@@ -113,11 +134,13 @@ class ChecksumVerifyService(BaseModuleService):
             "target_checksum": target_checksum,
             "diff_count": total_diff,
             "passed": passed,
+            "empty_batch": not batch_records and not staging_records and not unreadable,
+            "unreadable": unreadable,
             "chunk_diffs": chunk_diffs,
         }
 
         # 校验差异条目驱动冲突裁决创建
-        if total_diff > 0:
+        if total_diff > 0 and not unreadable:
             try:
                 cr_svc = self._safe_import("app.services.conflict_resolve", "ConflictResolveService")()
                 conflict_result = cr_svc.create_conflict(batch_code, total_diff)

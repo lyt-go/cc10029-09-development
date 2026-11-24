@@ -77,5 +77,42 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 空窗口与零行交付
+
+抽取窗口的数据校验把"可确认零行"与"文件暂不可读"严格分开，判据集中在
+`backend/app/services/delivery.py`：
+
+| 状态 | 含义 | 能否确认零行 | 能否建批/交付 |
+| --- | --- | --- | --- |
+| `HAS_RECORDS` | 产物可读且有记录，执行凭据匹配 | 否 | 是 |
+| `CONFIRMED_EMPTY` | 产物可读为空，且执行凭据记录零条 | 是 | 是（空窗口回执） |
+| `EMPTY_UNCONFIRMED` | 产物为空但缺失执行凭据 | 否 | 否 |
+| `MISSING` / `UNREADABLE` / `CORRUPT` | 文件不存在、不可读或无法解析 | 否 | 否（不补造数据） |
+| `CREDENTIAL_MISMATCH` / `UNVERIFIED` | 凭据条数或校验值与产物不一致 | 否 | 否 |
+
+- 执行凭据由 `execute_extract` 写入 `data/credentials/`，记录真实写入条数与 SHA256。
+- 完成回执写入 `data/receipts/`：数据窗口为 `DATA_WINDOW`，确认零行为
+  `EMPTY_WINDOW`。同一窗口同一内容重复处理只复用同一回执；内容变化产生新版本回执，
+  旧回执保留为 `SUPERSEDED` 可追溯。
+- 传输批次必须消费窗口完成回执建批（`ensure_batch_for_window`）；同一窗口同一回执只
+  对应一个批次，空窗口回执生成零记录批次并落地真实空文件。
+- 目标交付记录写入 `data/deliveries/<目标端>/<窗口>.json`；应到实到一致才算形成目标
+  回执，零行窗口的目标回执单列为"已交付_零行"。
+- 范围核销（`reconcile_range`）把窗口分为 `accounted` / `accounted_empty`（目标回执）、
+  `skipped`（源侧确认零行并结案、目标侧跳过）、`unaccounted`（未核销差异）。源侧结案后
+  又补到真实记录的窗口，旧结案失效，不会继续记作跳过。
+
+新增领域动作接口：
+
+```text
+POST /api/extract_window/validate       校验窗口数据，返回状态与拒绝原因
+POST /api/extract_window/complete       生成/复用完成回执（幂等）
+POST /api/extract_window/confirm-zero   确认零行（必须有执行凭据）
+POST /api/transfer_batch/ensure         消费完成回执幂等建批
+POST /api/transfer_batch/{id}/transfer  执行传输（重试复用同一交付结果）
+POST /api/arrival_reconcile/range       按连续窗口范围核销目标交付
+POST /api/arrival_reconcile/explain     值班解释窗口的闭合方式
+```
+
 领域：数据工程
 子方向：数仓与数据湖
